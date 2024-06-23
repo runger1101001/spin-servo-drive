@@ -3,20 +3,21 @@
 #include <SimpleFOCDrivers.h>
 #include <Wire.h>
 #include <settings/stm32/STM32FlashSettingsStorage.h>
-#include <encoders/ma730/MagneticSensorMA730SSI.h>
-#include <encoders/ma730/MagneticSensorMA730.h>
+#include <encoders/mt6835/MagneticSensorMT6835.h>
 #include <encoders/hysteresis/HysteresisSensor.h>
+#include <encoders/ma730/MagneticSensorMA730.h>
 #include <comms/telemetry/SimpleTelemetry.h>
 #include <comms/telemetry/TeleplotTelemetry.h>
+#include <comms/streams/PacketCommander.h>
 #include <utilities/stm32math/STM32G4CORDICTrigFunctions.h>
-
+#include <voltage/GenericVoltageSense.h>
 
 #define SERIAL_SPEED 115200
 
 #define MUX_SELECT PA6
 #define BUTTON PB5
-#define BATT_VOLTAGE_SENSE PA4
-#define TEMP_SENSE PA5
+#define BATT_VOLTAGE_SENSE PA5
+#define TEMP_SENSE PA6
 #define LED PC6
 
 // Define CAN bus pins
@@ -25,14 +26,17 @@
 
 
 // BLDC motor & driver instance
-BLDCMotor motor = BLDCMotor(4, 2.0f, 300.0f);
+BLDCMotor motor = BLDCMotor(5, 2.0f, 300.0f);
 BLDCDriver3PWM driver = BLDCDriver3PWM(PA0, PA1, PA2);
 
 //Position Sensor
 MagneticSensorMA730 sensor = MagneticSensorMA730(PB12);
 HysteresisSensor hysteresisSensor = HysteresisSensor(sensor, 0.001f);
 
+#ifdef USE_CURRENT_SENSE
 LowsideCurrentSense current_sense = LowsideCurrentSense(0.003, 46, PB0, PB1, PA3);
+#endif
+GenericVoltageSense voltage_sense = GenericVoltageSense(BATT_VOLTAGE_SENSE, 10.13f);
 
 // settings
 STM32FlashSettingsStorage settings = STM32FlashSettingsStorage(); // use 1 page at top of flash
@@ -59,9 +63,13 @@ void doSetSensor(char* cmd) {
 TextIO textIO = TextIO(Serial);
 //SimpleTelemetry telemetry = SimpleTelemetry();
 TeleplotTelemetry telemetry = TeleplotTelemetry();
+//Telemetry telemetry = Telemetry();
+PacketCommander pcommander = PacketCommander();
 void doDownsample(char* cmd) { telemetry.downsample = atoi(cmd); };
 
 void setup() {
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, HIGH);
   Serial.begin(SERIAL_SPEED);
   while (!Serial);
   SimpleFOCDebug::enable(&Serial);
@@ -83,27 +91,39 @@ void setup() {
 
   // driver config
   // power supply voltage [V]
-  driver.voltage_power_supply = 10;
+  voltage_sense.init();
+  for (int i = 0; i < 100; i++) {
+    voltage_sense.update();
+    delay(5);
+  }
+  Serial.print("Voltage: ");
+  Serial.println(voltage_sense.getVoltage());
+
+  driver.voltage_power_supply = 12;
   driver.voltage_limit = driver.voltage_power_supply*0.95f;
   driver.pwm_frequency	= 20000;
 
   driver.init();
   sensor.init();
+  FieldStrength res = sensor.getFieldStrength();
+  float angle = sensor.getAngle();
   hysteresisSensor.init();
 
-
-  FieldStrength fs = sensor.getFieldStrength();
-  Serial.print("Field strength: 0x");
-  Serial.println(fs, HEX);
+  Serial.print("MA732 field strength: 0x");
+  Serial.println(res, HEX);
+  Serial.print("MA732 initial angle: ");
+  Serial.println(angle);
 
   // link driver
   motor.linkDriver(&driver);
-  motor.linkSensor(&hysteresisSensor);
+  motor.linkSensor(&sensor);
 
   // current sense
+  #ifdef USE_CURRENT_SENSE
   current_sense.linkDriver(&driver);
   current_sense.init();
   motor.linkCurrentSense(&current_sense);
+  #endif
 
   // aligning voltage
   motor.voltage_sensor_align = 2;
@@ -123,8 +143,22 @@ void setup() {
   motor.P_angle.output_ramp = 1000;
   motor.LPF_angle.Tf = 0.005f;
 
+  motor.PID_current_q.P = 3.0f;
+  motor.PID_current_q.I = 300.0f;
+  motor.PID_current_q.D = 0.0f;
+  motor.PID_current_q.output_ramp = 0.0f;
+  motor.PID_current_q.limit = 3.0f;
+  motor.LPF_current_q.Tf = 0.001f;
+  motor.PID_current_d.P = 3.0f;
+  motor.PID_current_d.I = 300.0f;
+  motor.PID_current_d.D = 0.0f;
+  motor.PID_current_d.output_ramp = 0.0f;
+  motor.PID_current_d.limit = 3.0f;
+  motor.LPF_current_d.Tf = 0.001f;
+
+
   motor.torque_controller = TorqueControlType::foc_current;
-  motor.controller = MotionControlType::angle;
+  motor.controller = MotionControlType::torque;
   motor.motion_downsample = 10;
 
   // load settings
@@ -150,13 +184,17 @@ void setup() {
   command.add('d', doDownsample, "downsample telemetry");
   command.add('r', doReinit, "reinit motor");
   command.add('h', doHysteresis, "hysteresis amount");
-  command.add('S', doSetSensor, "set sensor (0=MA730, 1=hysteresis)");
+  command.add('S', doSetSensor, "set sensor (0=MT6835, 1=hysteresis)");
   // add telemetry
   telemetry.addMotor(&motor);
   telemetry.downsample = 0; // off by default, use register 28 to set
-  uint8_t telemetry_registers[] = { REG_TARGET, REG_ANGLE, REG_VELOCITY, REG_SENSOR_MECHANICAL_ANGLE, REG_ITERATIONS_SEC };
+  //uint8_t telemetry_registers[] = { REG_ANGLE, REG_POSITION };
+  uint8_t telemetry_registers[] = { REG_TARGET, REG_VELOCITY, REG_SENSOR_MECHANICAL_ANGLE, REG_CURRENT_Q, REG_CURRENT_D, REG_CURRENT_A, REG_CURRENT_B, REG_CURRENT_C };
   telemetry.setTelemetryRegisters(sizeof(telemetry_registers)/sizeof(SimpleFOCRegister), telemetry_registers);
   telemetry.init(textIO);
+  pcommander.addMotor(&motor);
+  pcommander.init(textIO);
+  pcommander.echo = true;
 
   Serial.println(F("Motor ready."));
   Serial.println(F("Set the target using serial terminal:"));
@@ -169,7 +207,8 @@ void loop() {
   // main FOC algorithm function
   motor.loopFOC();
   // user communication
-  command.run();
+  //command.run();
+  pcommander.run();
   // telemetry
   telemetry.run();
 }
